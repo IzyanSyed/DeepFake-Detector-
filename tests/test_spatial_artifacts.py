@@ -1,66 +1,104 @@
-import unittest
+"""Tests for SpatialArtifactsDetector (fully mocked: no model downloads or real inference)."""
+
+import asyncio
+
+import numpy as np
 import torch
-import sys
-import os
+from torch import nn
 
-# Ensure src is in Python path for test import
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
-
-from deepfake_detector.detectors.spatial_artifacts import (
-    SpatialArtifactsDetector,
-    PixelBranch,
-    FrequencyBranch
-)
+from deepfake_detector.config import Settings
+from deepfake_detector.detectors.base import SignalFamily
+from deepfake_detector.detectors.spatial_artifacts import SpatialArtifactsDetector
+from deepfake_detector.ingestion.stream_reader import SignalWindow
 
 
-class TestSpatialArtifactsDetector(unittest.TestCase):
+class _StubPixelBranch(nn.Module):
+    """Returns a constant logit for every frame in the batch."""
 
-    def setUp(self):
-        self.feature_dim = 128
-        self.model = SpatialArtifactsDetector(feature_dim=self.feature_dim, dropout_rate=0.3)
-        self.model.eval()
+    def __init__(self, logit: float) -> None:
+        super().__init__()
+        self.logit = logit
 
-    def test_pixel_branch_shape(self):
-        branch = PixelBranch(in_channels=3, feature_dim=self.feature_dim)
-        x = torch.randn(2, 3, 128, 128)
-        out = branch(x)
-        self.assertEqual(out.shape, (2, self.feature_dim))
-
-    def test_frequency_branch_shape(self):
-        branch = FrequencyBranch(in_channels=3, feature_dim=self.feature_dim)
-        x = torch.randn(2, 3, 128, 128)
-        out = branch(x)
-        self.assertEqual(out.shape, (2, self.feature_dim))
-
-    def test_detector_forward_shape(self):
-        x = torch.randn(4, 3, 224, 224)
-        logits = self.model(x)
-        self.assertEqual(logits.shape, (4, 1))
-
-    def test_detector_predict_output(self):
-        x = torch.rand(2, 3, 128, 128)
-        res = self.model.predict(x)
-        
-        self.assertIn("probabilities", res)
-        self.assertIn("logits", res)
-        self.assertIn("pixel_features", res)
-        self.assertIn("frequency_features", res)
-
-        probs = res["probabilities"]
-        self.assertEqual(probs.shape, (2,))
-        self.assertTrue(torch.all(probs >= 0.0) and torch.all(probs <= 1.0))
-
-        pixel_feats = res["pixel_features"]
-        self.assertEqual(pixel_feats.shape, (2, self.feature_dim))
-
-        freq_feats = res["frequency_features"]
-        self.assertEqual(freq_feats.shape, (2, self.feature_dim))
-
-    def test_single_batch_inference(self):
-        x = torch.randn(1, 3, 380, 380)
-        logits = self.model(x)
-        self.assertEqual(logits.shape, (1, 1))
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return torch.full((inputs.shape[0], 1), self.logit)
 
 
-if __name__ == '__main__':
-    unittest.main()
+class _StubFrequencyBranch(nn.Module):
+    """Returns a constant logit for every frame in the batch."""
+
+    def __init__(self, logit: float) -> None:
+        super().__init__()
+        self.logit = logit
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return torch.full((inputs.shape[0], 1), self.logit)
+
+
+def _make_detector(monkeypatch, *, pixel_logit=0.0, frequency_logit=0.0, mediapipe_box=None, haar_box=None):
+    detector = SpatialArtifactsDetector(
+        settings=Settings(),
+        pixel_model=_StubPixelBranch(pixel_logit),
+        frequency_model=_StubFrequencyBranch(frequency_logit),
+    )
+    monkeypatch.setattr(detector, "_detect_face_mediapipe", lambda rgb: mediapipe_box)
+    monkeypatch.setattr(detector, "_detect_face_haar", lambda rgb: haar_box)
+    return detector
+
+
+def _make_window(num_frames: int = 3) -> SignalWindow:
+    frames = [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8) for _ in range(num_frames)]
+    return SignalWindow(frames=frames, timestamp=0.0, window_id="test-window")
+
+
+def test_no_face_detected_returns_zero_confidence(monkeypatch):
+    detector = _make_detector(monkeypatch)
+    result = asyncio.run(detector.analyze(_make_window()))
+    assert result.confidence == 0.0
+    assert result.raw_signals["face_detection_method"] == "none"
+
+
+def test_mediapipe_face_detection_used(monkeypatch):
+    detector = _make_detector(
+        monkeypatch,
+        mediapipe_box=(5, 5, 30, 30),
+        haar_box=(0, 0, 10, 10),
+    )
+    result = asyncio.run(detector.analyze(_make_window()))
+    assert result.raw_signals["face_detection_method"] == "mediapipe"
+    assert result.confidence > 0.0
+
+
+def test_haar_fallback_used_when_mediapipe_fails(monkeypatch):
+    detector = _make_detector(
+        monkeypatch,
+        mediapipe_box=None,
+        haar_box=(0, 0, 20, 20),
+    )
+    result = asyncio.run(detector.analyze(_make_window()))
+    assert result.raw_signals["face_detection_method"] == "haar"
+
+
+def test_fusion_output_in_unit_range(monkeypatch):
+    for pixel_logit, frequency_logit in [(15.0, 15.0), (-15.0, -15.0), (15.0, -15.0)]:
+        detector = _make_detector(
+            monkeypatch,
+            pixel_logit=pixel_logit,
+            frequency_logit=frequency_logit,
+            mediapipe_box=(5, 5, 30, 30),
+        )
+        result = asyncio.run(detector.analyze(_make_window()))
+        assert 0.0 <= result.score <= 1.0
+
+
+def test_detector_result_fields_populated(monkeypatch):
+    detector = _make_detector(monkeypatch, mediapipe_box=(5, 5, 30, 30))
+    result = asyncio.run(detector.analyze(_make_window()))
+    assert isinstance(result.score, float)
+    assert isinstance(result.confidence, float)
+    assert isinstance(result.latency_ms, float)
+    assert result.latency_ms >= 0.0
+    assert result.signal_family is SignalFamily.SPATIAL_ARTIFACTS
+    assert isinstance(result.raw_signals, dict)
+    assert isinstance(result.raw_signals["pixel_branch_score"], float)
+    assert isinstance(result.raw_signals["frequency_branch_score"], float)
+    assert isinstance(result.raw_signals["high_frequency_energy_ratio"], float)
